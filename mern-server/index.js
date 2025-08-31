@@ -1,6 +1,6 @@
+// index.js
+
 require('dotenv').config();
-
-
 
 const express = require('express');
 const app = express();
@@ -22,10 +22,9 @@ const uri = process.env.DB_URI;
 const client = new MongoClient(uri, {
     serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true }
 });
-
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// --- Multer Configuration for file upload ---
+// --- Multer Configuration ---
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, 'uploads/'),
     filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
@@ -43,8 +42,11 @@ const upload = multer({
 
 // --- JWT Verification Middleware ---
 function verifyToken(req, res, next) {
-    const token = req.headers['authorization']?.split(' ')[1];
-    if (!token) return res.status(403).send({ message: 'No token provided.' });
+    const authHeader = req.headers['authorization'];
+    if (!authHeader) return res.status(403).send({ message: 'No token provided.' });
+
+    const token = authHeader.split(' ')[1];
+    if (!token) return res.status(403).send({ message: 'Malformed token.' });
 
     jwt.verify(token, JWT_SECRET, (err, decoded) => {
         if (err) return res.status(500).send({ message: 'Failed to authenticate token.' });
@@ -53,14 +55,13 @@ function verifyToken(req, res, next) {
     });
 }
 
-
 async function run() {
     try {
         await client.connect();
         const database = client.db("PropertyInventory");
         const propertyCollection = database.collection("property");
         const userCollection = database.collection("users");
-
+        
         console.log("Successfully connected to MongoDB!");
 
         // --- Authentication Routes ---
@@ -68,7 +69,17 @@ async function run() {
             const { name, phone, email, password } = req.body;
             const hashedPassword = await bcrypt.hash(password, 10);
             try {
-                await userCollection.insertOne({ name, phone, email, password: hashedPassword, purchasedProperties: [], shortlist: [] });
+                await userCollection.insertOne({ 
+                    name, 
+                    phone, 
+                    email, 
+                    password: hashedPassword, 
+                    purchasedProperties: [], 
+                    shortlist: [],
+                    reviews: [],
+                    trustedBy: [],
+                    goldenBadges: [] 
+                });
                 res.status(201).send({ message: "User created successfully!" });
             } catch (error) {
                 res.status(500).send({ message: "Error creating user", error });
@@ -106,14 +117,12 @@ async function run() {
                 const user = await userCollection.findOne({ _id: new ObjectId(req.userId) }, { projection: { password: 0 } });
                 if (!user) return res.status(404).send("User not found");
                 
-                // Fetch details of purchased properties
                 if (user.purchasedProperties && user.purchasedProperties.length > 0) {
                     const purchasedIds = user.purchasedProperties.map(id => new ObjectId(id));
                     user.purchasedPropertiesDetails = await propertyCollection.find({ _id: { $in: purchasedIds } }).toArray();
                 } else {
                     user.purchasedPropertiesDetails = [];
                 }
-
                 res.status(200).json(user);
             } catch (error) {
                 res.status(500).send({ message: "Error fetching profile", error });
@@ -133,6 +142,59 @@ async function run() {
             }
         });
 
+        // --- Seller Profile Routes ---
+        app.get('/api/seller/:id', verifyToken, async (req, res) => {
+            try {
+                const seller = await userCollection.findOne(
+                    { _id: new ObjectId(req.params.id) },
+                    { projection: { password: 0, purchasedProperties: 0, shortlist: 0 } }
+                );
+                if (!seller) return res.status(404).send({ message: "Seller not found" });
+
+                // Add counts to the response
+                seller.trustCount = seller.trustedBy ? seller.trustedBy.length : 0;
+                seller.goldenBadgeCount = seller.goldenBadges ? seller.goldenBadges.length : 0;
+                
+                res.status(200).json(seller);
+            } catch (error) {
+                res.status(500).send({ message: "Error fetching seller profile", error });
+            }
+        });
+
+        app.post('/api/seller/:id/review', verifyToken, async (req, res) => {
+            const { reviewText } = req.body;
+            const reviewer = await userCollection.findOne({ _id: new ObjectId(req.userId) });
+
+            const review = {
+                reviewerId: req.userId,
+                reviewerName: reviewer.name,
+                text: reviewText,
+                date: new Date()
+            };
+
+            await userCollection.updateOne(
+                { _id: new ObjectId(req.params.id) },
+                { $push: { reviews: review } }
+            );
+            res.status(200).send({ message: "Review added successfully" });
+        });
+
+        app.post('/api/seller/:id/trust', verifyToken, async (req, res) => {
+            await userCollection.updateOne(
+                { _id: new ObjectId(req.params.id) },
+                { $addToSet: { trustedBy: new ObjectId(req.userId) } }
+            );
+            res.status(200).send({ message: "Seller marked as trusted" });
+        });
+
+        app.post('/api/seller/:id/golden-badge', verifyToken, async (req, res) => {
+             await userCollection.updateOne(
+                { _id: new ObjectId(req.params.id) },
+                { $addToSet: { goldenBadges: new ObjectId(req.userId) } }
+            );
+            res.status(200).send({ message: "Golden badge given" });
+        });
+
 
         // --- Property Routes ---
         app.post("/upload-property", verifyToken, upload.single('image'), async (req, res) => {
@@ -142,7 +204,6 @@ async function run() {
             const price = parseFloat(data.price) || 0;
             const vatRate = parseFloat(data.vatRate) || 0;
             const previousPrice = parseFloat(data.previousPrice) || 0;
-
             const priceWithVat = price + (price * (vatRate / 100));
             const priceChange = price - previousPrice;
             const incrementDecrementText = priceChange >= 0 ? `${priceChange.toFixed(2)} (Increment)` : `${Math.abs(priceChange).toFixed(2)} (Decrement)`;
@@ -156,8 +217,8 @@ async function run() {
                 priceChange: incrementDecrementText,
                 image: req.file.path,
                 ownerId: new ObjectId(req.userId),
-                status: 'available', // 'available' or 'sold'
-                bids: [], // To store bidding info
+                status: 'available', // 'available', 'pending', or 'sold'
+                bids: [], 
             };
             
             const result = await propertyCollection.insertOne(propertyData);
@@ -165,7 +226,7 @@ async function run() {
         });
 
         app.get("/all-property", async (req, res) => {
-            let query = { status: 'available' }; // Only show available properties
+            let query = { status: { $in: ['available', 'pending'] } };
             
             if (req.query.type) query.type = { $regex: req.query.type, $options: 'i' };
             if (req.query.location) query.location = { $regex: req.query.location, $options: 'i' };
@@ -179,7 +240,6 @@ async function run() {
             const property = await propertyCollection.findOne({_id: new ObjectId(req.params.id)});
             res.send(property);
         });
-
 
         // --- Bidding Routes ---
         app.post('/api/property/:id/bid', verifyToken, async (req, res) => {
@@ -201,7 +261,7 @@ async function run() {
         });
 
         app.post('/api/property/:id/accept-bid', verifyToken, async (req, res) => {
-            const { bidUserId } = req.body;
+            const { bidUserId, bidPrice } = req.body;
             const property = await propertyCollection.findOne({ _id: new ObjectId(req.params.id) });
 
             if (property.ownerId.toString() !== req.userId) {
@@ -210,17 +270,20 @@ async function run() {
 
             await propertyCollection.updateOne(
                 { _id: new ObjectId(req.params.id) },
-                { $set: { winningBidder: new ObjectId(bidUserId) } }
+                { $set: { 
+                    winningBidder: new ObjectId(bidUserId),
+                    winningPrice: parseFloat(bidPrice),
+                    status: 'pending' // Property is now pending payment
+                } }
             );
             res.status(200).send({ message: "Bid accepted." });
         });
-
 
         // --- Shortlist & Payment Routes ---
         app.post('/api/shortlist/:propertyId', verifyToken, async (req, res) => {
             await userCollection.updateOne(
                 { _id: new ObjectId(req.userId) },
-                { $addToSet: { shortlist: new ObjectId(req.params.propertyId) } } // $addToSet prevents duplicates
+                { $addToSet: { shortlist: new ObjectId(req.params.propertyId) } }
             );
             res.status(200).send({ message: "Added to shortlist." });
         });
@@ -242,29 +305,25 @@ async function run() {
             const propertyId = new ObjectId(req.params.propertyId);
             const userId = new ObjectId(req.userId);
 
-            // Mark property as sold
             await propertyCollection.updateOne(
                 { _id: propertyId },
                 { $set: { status: 'sold', buyerId: userId } }
             );
 
-            // Add to user's purchased list
             await userCollection.updateOne(
                 { _id: userId },
                 { $push: { purchasedProperties: propertyId } }
             );
 
-            // Remove from all users' shortlists (this is an advanced operation, a simpler way is to filter on the front-end)
             await userCollection.updateMany({}, { $pull: { shortlist: propertyId } });
             
             res.status(200).send({ message: "Purchase successful!" });
         });
 
-
         app.get('/', (req, res) => res.send('Property Server is Running!'));
 
     } finally {
-        // await client.close(); // Keep connection open
+        // await client.close();
     }
 }
 
@@ -273,3 +332,4 @@ run().catch(console.dir);
 app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
 });
+
